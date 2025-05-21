@@ -100,23 +100,42 @@ class ReverseDistillationModel(nn.Module):
         s_feats = self.student(bneck)
         return t_feats, s_feats
 
-def distillation_loss(t_feats, s_feats):
+def distillation_loss(t_feats, s_feats, reduction='mean'):
     """
-    Вычисляет косинусную потерю между признаками учителя и студента,
-    выравнивая списки признаков по разрешению.
+    Косинусная «потеря» между признаками учителя и студента.
+    - t_feats: список тензоров [B, C, H, W] из модели-учителя
+    - s_feats: список тензоров [B, C, H, W] из модели-студента
+    - reduction: 'none' | 'mean' | 'sum'
+    Возвращает:
+      - если reduction='none': тензор [B]
+      - иначе: скаляр
     """
-    loss = 0.0
-    # Студент выдаёт признаки в порядке [8x8,16x16,32x32,64x64]
-    # Учитель выдаёт в порядке [64x64,32x32,16x16,8x8]
-    # Поэтому переворачиваем выход студента
+    # Переворачиваем признаки студента, чтобы разрешения совпадали
     s_feats_rev = list(reversed(s_feats))
-    for t, s in zip(t_feats, s_feats_rev):
-        B, C, H, W = t.shape
-        t_flat = t.view(B, C, -1)
-        s_flat = s.view(B, C, -1)
-        loss += torch.mean(1 - F.cosine_similarity(t_flat, s_flat, dim=1))
-    return loss
+    B = t_feats[0].shape[0]
+    device = t_feats[0].device
 
+    # Собираем пер-сэмпл потери
+    loss_per_sample = torch.zeros(B, device=device)
+    for t, s in zip(t_feats, s_feats_rev):
+        # приводим к [B, C, H*W]
+        t_flat = t.view(B, t.shape[1], -1)
+        s_flat = s.view(B, s.shape[1], -1)
+        # получаем [B, H*W] косинусных схожестей
+        cos = F.cosine_similarity(t_flat, s_flat, dim=1)
+        # и усредняем по пространству → [B]
+        loss_per_sample += (1 - cos).mean(dim=1)
+
+    # нормируем по числу уровней (опционально)
+    loss_per_sample /= len(t_feats)
+
+    if reduction == 'none':
+        return loss_per_sample
+    elif reduction == 'sum':
+        return loss_per_sample.sum()
+    else:  # 'mean'
+        return loss_per_sample.mean()
+    
 # --- Синтетический генератор аномалий ---
 class NoiseGenerator(nn.Module):
     def __init__(self, channels=3):
@@ -157,33 +176,54 @@ def train_student(model, loader, epochs=20, lr=5e-4, device='cuda'):
             total += loss.item() * imgs.size(0)
         print(f"Epoch {epoch+1}/{epochs}, Loss: {total/len(loader.dataset):.4f}")
 
-# --- Генерация и оценка синтетических аномалий ---
 def generate_and_evaluate(model, noise_gen, loader, device='cuda'):
-    model.eval(); noise_gen.eval()
-    from sklearn.metrics import roc_auc_score
+    """
+    Генерация синтетических аномалий, сбор скорингов для нормальных и аномальных
+    примеров и оценка ROC-AUC.
+    """
+    model.eval()
+    noise_gen.eval()
     scores, labels = [], []
+
     with torch.no_grad():
         for imgs, _ in loader:
             imgs = imgs.to(device)
+
+            # 1) Оцениваем «нормальные» изображения
+            t_feats_clean = model.teacher(imgs)
+            fused_clean   = model.msf(t_feats_clean)
+            bneck_clean   = model.oce(fused_clean)
+            s_feats_clean = model.student(bneck_clean)
+
+            # получаем вектор скорингов (малая потеря на норме)
+            clean_scores = distillation_loss(t_feats_clean, s_feats_clean, reduction='none')
+            scores += clean_scores.cpu().tolist()
+            labels += [0] * clean_scores.size(0)
+
+            # 2) Оцениваем «аномальные» (синтетические) изображения
             anom = noise_gen(imgs)
-            t_feats = model.teacher(anom)
-            fused = model.msf(t_feats)
-            bneck = model.oce(fused)
-            s_feats = model.student(bneck)
-            lm = 0
-            for t, s in zip(t_feats, s_feats): lm += (1 - F.cosine_similarity(t, s, dim=1))
-            score = lm.view(lm.size(0), -1).mean(dim=1)
-            scores += score.cpu().tolist()
-            labels += [1] * len(score)
-    print(f"Synthetic Anomaly ROC-AUC: {roc_auc_score(labels, scores):.3f}")
+            t_feats_anom = model.teacher(anom)
+            fused_anom   = model.msf(t_feats_anom)
+            bneck_anom   = model.oce(fused_anom)
+            s_feats_anom = model.student(bneck_anom)
+
+            # большая потеря для аномалий → метка 1
+            anom_scores = distillation_loss(t_feats_anom, s_feats_anom, reduction='none')
+            scores += anom_scores.cpu().tolist()
+            labels += [1] * anom_scores.size(0)
+
+    from sklearn.metrics import roc_auc_score
+    # Теперь и чистые, и аномальные примеры присутствуют
+    auc = roc_auc_score(labels, scores)
+    print(f"Synthetic Anomaly ROC-AUC: {auc:.3f}")
 
 # --- Основной запуск ---
 if __name__ == '__main__':
     import torch.multiprocessing as mp
-    mp.set_start_method('fork', force=True)
+    # mp.set_start_method('fork', force=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     transform = transforms.Compose([transforms.Resize((256,256)), transforms.ToTensor()])
-    train_ds = FlatFolderDataset('project/dataset/normal', transform=transform)
+    train_ds = FlatFolderDataset('data/human', transform=transform)
     train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
     model = ReverseDistillationModel('resnet50', pretrained=True)
     train_student(model, train_loader, epochs=20, lr=5e-4, device=device)
