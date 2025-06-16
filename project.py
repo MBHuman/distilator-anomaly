@@ -5,6 +5,8 @@ from torchvision import models, transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import glob, os
+import random
+import torchvision.utils as vutils
 
 # --- Teacher Encoder (frozen ResNet) ---
 class TeacherEncoder(nn.Module):
@@ -202,19 +204,43 @@ if __name__ == '__main__':
 
     # Build and train model
     model = ReverseDistillationModel(backbone='resnet50', pretrained=True)
-    train(model, train_loader, epochs=1, lr=5e-4, device=device)
+    train(model, train_loader, epochs=20, lr=5e-4, device=device)
 
  # Synthetic anomaly generator (Gaussian noise)
-    def synth_anomaly(x, sigma=0.2):
-        noise = torch.randn_like(x) * sigma
-        return torch.clamp(x + noise, 0.0, 1.0)
+    def synth_anomaly(x, num_patches=5, patch_size=(32, 32), sigma=0.5):
+        """
+        Добавляет шумовые артефакты в случайные патчи изображения.
+        x: [1, C, H, W] или [C, H, W]
+        """
+        if x.dim() == 3:
+            x = x.unsqueeze(0)  # [1, C, H, W]
+        x_noised = x.clone()
+        _, C, H, W = x.shape
+
+        for _ in range(num_patches):
+            h = random.randint(0, H - patch_size[0])
+            w = random.randint(0, W - patch_size[1])
+            patch = x[:, :, h:h+patch_size[0], w:w+patch_size[1]]
+
+            # Сильный шум или случайный "артефакт"
+            noise = torch.randn_like(patch) * sigma
+            patch_anom = torch.clamp(patch + noise, 0.0, 1.0)
+
+            x_noised[:, :, h:h+patch_size[0], w:w+patch_size[1]] = patch_anom
+
+        return x_noised.squeeze(0)
+    
+    # Папка для сохранения аномальных изображений
+    save_dir = 'results/synthetic_anomalies'
+    os.makedirs(save_dir, exist_ok=True)
+
 
     # Prepare evaluation on synthetic anomalies
     normal_paths = glob.glob('data/test/*.png') + glob.glob('data/test/*.bmp')
     y_true, y_scores = [], []
     model.eval()
     with torch.no_grad():
-        for path in normal_paths:
+        for i, path in enumerate(normal_paths):
             img = infer_tf(Image.open(path).convert('RGB')).to(device)
             # Compute clean score
             amap_clean = compute_anomaly_map(model, img, device=device)
@@ -228,6 +254,10 @@ if __name__ == '__main__':
             score_anom = amap_anom.mean().item()
             y_true.append(1)
             y_scores.append(score_anom)
+                
+            # Сохраняем аномальное изображение
+            save_path = os.path.join(save_dir, f"anomaly_{i:04d}.png")
+            vutils.save_image(img_anom.cpu(), save_path)
 
     # Compute ROC AUC
     from sklearn.metrics import roc_auc_score
